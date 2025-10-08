@@ -196,13 +196,40 @@ def hf_transform_to_torch(items_dict: dict[torch.Tensor | None]):
     for key in items_dict:
         first_item = items_dict[key][0]
         if isinstance(first_item, PILImage.Image):
-            to_tensor = transforms.ToTensor()
-            items_dict[key] = [to_tensor(img) for img in items_dict[key]]
+            # Check if this is a depth image by looking at the image mode
+            if first_item.mode == "I;16":  # 16-bit grayscale depth image
+                # Custom handling for 16-bit depth images
+                items_dict[key] = [_convert_16bit_depth_to_tensor(img) for img in items_dict[key]]
+            else:
+                # Standard handling for RGB/grayscale images
+                to_tensor = transforms.ToTensor()
+                items_dict[key] = [to_tensor(img) for img in items_dict[key]]
         elif first_item is None:
             pass
         else:
             items_dict[key] = [torch.tensor(x) for x in items_dict[key]]
     return items_dict
+
+
+def _convert_16bit_depth_to_tensor(pil_image: PILImage.Image) -> torch.Tensor:
+    """Convert 16-bit depth PIL image to proper float32 tensor in [0,1] range.
+    
+    Args:
+        pil_image: PIL Image in mode "I;16" (16-bit grayscale)
+    
+    Returns:
+        torch.Tensor: Shape (1, H, W) with float32 values in [0,1] range
+    """
+    # Convert PIL image to numpy array
+    depth_array = np.array(pil_image, dtype=np.uint16)
+    
+    # Convert to float32 and normalize to [0,1] range
+    depth_normalized = depth_array.astype(np.float32) / 65535.0
+    
+    # Convert to tensor and add channel dimension: (H, W) -> (1, H, W)
+    depth_tensor = torch.from_numpy(depth_normalized).unsqueeze(0)
+    
+    return depth_tensor
 
 
 def _get_major_minor(version: str) -> tuple[int]:
@@ -407,7 +434,8 @@ def check_timestamps_sync(
     This check is to make sure that each timestamps is separated to the next by 1/fps +/- tolerance to
     account for possible numerical error.
     """
-    timestamps = torch.stack(hf_dataset["timestamp"])
+    # Convert Column to a Python list of tensors before stacking
+    timestamps = torch.stack(list(hf_dataset["timestamp"]))
     diffs = torch.diff(timestamps)
     within_tolerance = torch.abs(diffs - 1 / fps) <= tolerance_s
 
@@ -425,7 +453,7 @@ def check_timestamps_sync(
         filtered_indices = original_indices[mask]
         outside_tolerance_filtered_indices = torch.nonzero(~filtered_within_tolerance)  # .squeeze()
         outside_tolerance_indices = filtered_indices[outside_tolerance_filtered_indices]
-        episode_indices = torch.stack(hf_dataset["episode_index"])
+        episode_indices = torch.stack(list(hf_dataset["episode_index"]))
 
         outside_tolerances = []
         for idx in outside_tolerance_indices:
