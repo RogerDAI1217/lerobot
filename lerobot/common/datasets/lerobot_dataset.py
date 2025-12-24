@@ -754,8 +754,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
         Use 'encode_videos' if you want to encode videos during the saving of this episode. Otherwise,
         you can do it later with dataset.consolidate(). This is to give more flexibility on when to spend
         time for video encoding.
+        
+        Args:
+            task: Task name for this episode
+            encode_videos: Whether to encode videos immediately
+            episode_data: Optional pre-built episode buffer. If provided, uses this instead of 
+                         self.episode_buffer and does NOT reset the internal buffer.
         """
-        if not episode_data:
+        if episode_data is not None:
+            episode_buffer = episode_data
+        else:
             episode_buffer = self.episode_buffer
 
         episode_length = episode_buffer.pop("size")
