@@ -131,15 +131,25 @@ def encode_video_frames(
     imgs_dir: Path | str,
     video_path: Path | str,
     fps: int,
-    vcodec: str = "libsvtav1",
+    vcodec: str = "libx264",
     pix_fmt: str = "yuv420p",
-    g: int | None = 2,
-    crf: int | None = 30,
-    fast_decode: int = 0,
+    g: int | None = None,
+    crf: int | None = 23,
+    preset: str | None = "fast",
     log_level: str | None = "error",
     overwrite: bool = False,
 ) -> None:
-    """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
+    """
+    Encode PNG frames to video using ffmpeg.
+    
+    Default settings optimized for fast decoding during training:
+    - libx264 codec with fast preset for reasonable encode speed
+    - CRF 23 for good quality/size balance
+    - No explicit GOP (uses ffmpeg default ~250 frames) for smaller files
+    - fast preset balances encode speed and compression
+    
+    More info on ffmpeg arguments tuning on `benchmark/video/README.md`
+    """
     video_path = Path(video_path)
     video_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -153,16 +163,15 @@ def encode_video_frames(
         ]
     )
 
+    # Add preset for x264/x265 codecs
+    if preset is not None and vcodec in ["libx264", "libx265"]:
+        ffmpeg_args["-preset"] = preset
+
     if g is not None:
         ffmpeg_args["-g"] = str(g)
 
     if crf is not None:
         ffmpeg_args["-crf"] = str(crf)
-
-    if fast_decode:
-        key = "-svtav1-params" if vcodec == "libsvtav1" else "-tune"
-        value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
-        ffmpeg_args[key] = value
 
     if log_level is not None:
         ffmpeg_args["-loglevel"] = str(log_level)
