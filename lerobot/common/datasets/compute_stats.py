@@ -15,8 +15,11 @@
 # limitations under the License.
 from copy import deepcopy
 from math import ceil
+from pathlib import Path
 
 import einops
+import numpy as np
+import pandas as pd
 import torch
 import tqdm
 
@@ -75,6 +78,165 @@ def get_stats_einops_patterns(dataset, num_workers=0):
             raise ValueError(f"{key}, {batch[key].shape}")
 
     return stats_patterns
+
+
+def compute_stats_from_parquet(dataset_root: str | Path) -> dict[str, dict[str, torch.Tensor]]:
+    """Compute stats for low-dim features directly from parquet files (no video decoding).
+
+    This is much faster than compute_stats() which iterates through the full dataset
+    including video frame decoding. Matches the approach used by gr00t's generate_stats().
+
+    Computes: mean, std, min, max, q01, q99 for each float feature in the parquet data.
+
+    Args:
+        dataset_root: Path to the dataset root directory containing data/*/*.parquet and meta/info.json.
+
+    Returns:
+        Dict mapping feature names to dicts of stat tensors.
+    """
+    import json
+
+    dataset_root = Path(dataset_root)
+
+    # Identify low-dim (float) features from info.json
+    with open(dataset_root / "meta" / "info.json", "r") as f:
+        info = json.load(f)
+    lowdim_features = [
+        feat for feat, spec in info["features"].items()
+        if "float" in spec.get("dtype", "")
+    ]
+
+    # Load all parquet files
+    parquet_paths = sorted(dataset_root.glob("data/*/*.parquet"))
+    all_data = pd.concat(
+        [pd.read_parquet(p) for p in tqdm.tqdm(parquet_paths, desc="Loading parquet files")],
+        axis=0,
+    )
+
+    stats = {}
+    for feat in lowdim_features:
+        if feat not in all_data.columns:
+            continue
+        np_data = np.vstack([np.asarray(x, dtype=np.float32) for x in all_data[feat]])
+        stats[feat] = {
+            "mean": torch.from_numpy(np.mean(np_data, axis=0).astype(np.float32)),
+            "std": torch.from_numpy(np.std(np_data, axis=0).astype(np.float32)),
+            "min": torch.from_numpy(np.min(np_data, axis=0).astype(np.float32)),
+            "max": torch.from_numpy(np.max(np_data, axis=0).astype(np.float32)),
+            "q01": torch.from_numpy(np.quantile(np_data, 0.01, axis=0).astype(np.float32)),
+            "q99": torch.from_numpy(np.quantile(np_data, 0.99, axis=0).astype(np.float32)),
+        }
+    return stats
+
+
+def compute_relative_stats_from_parquet(
+    dataset_root: str | Path,
+    relative_action_keys: list[str] | None = None,
+    delta_indices: list[int] | None = None,
+) -> dict[str, dict[str, list]]:
+    """Compute relative action stats from parquet files. Matches gr00t's generate_rel_stats().
+
+    For each timestep t and future offset k in delta_indices, computes:
+        relative_action[k] = action[t + k] - state[t]
+    Then computes stats (mean, std, min, max, q01, q99) over all relative action chunks.
+
+    Only joint-space (NON_EEF) actions are supported (simple subtraction).
+
+    Args:
+        dataset_root: Path to the dataset root directory.
+        relative_action_keys: Action keys to compute relative stats for (e.g., ["left_arm", "right_arm"]).
+            If None, defaults to ["left_arm", "right_arm"].
+        delta_indices: Action horizon indices. If None, defaults to list(range(0, 50)).
+
+    Returns:
+        Dict mapping action key names to dicts of stat lists, ready for JSON serialization.
+        E.g., {"left_arm": {"mean": [...], "std": [...], ...}, "right_arm": {...}}
+    """
+    import json
+
+    dataset_root = Path(dataset_root)
+
+    if relative_action_keys is None:
+        relative_action_keys = ["left_arm", "right_arm"]
+    if delta_indices is None:
+        delta_indices = list(range(0, 50))
+
+    # Load modality.json to get start/end indices for slicing
+    with open(dataset_root / "meta" / "modality.json", "r") as f:
+        modality_meta = json.load(f)
+
+    # Load episodes metadata to get episode boundaries
+    episodes = []
+    with open(dataset_root / "meta" / "episodes.jsonl", "r") as f:
+        for line in f:
+            episodes.append(json.loads(line))
+
+    # Load info for chunk size and data path pattern
+    with open(dataset_root / "meta" / "info.json", "r") as f:
+        info = json.load(f)
+    chunk_size = info["chunks_size"]
+    data_path_pattern = info["data_path"]
+
+    rel_stats = {}
+    for action_key in relative_action_keys:
+        if action_key not in modality_meta.get("action", {}):
+            print(f"Warning: action key '{action_key}' not found in modality.json, skipping")
+            continue
+        if action_key not in modality_meta.get("state", {}):
+            print(f"Warning: state key '{action_key}' not found in modality.json, skipping")
+            continue
+
+        action_info = modality_meta["action"][action_key]
+        state_info = modality_meta["state"][action_key]
+        a_start, a_end = action_info["start"], action_info["end"]
+        s_start, s_end = state_info["start"], state_info["end"]
+        action_col = action_info.get("original_key", "action")
+        state_col = state_info.get("original_key", "observation.state")
+
+        max_offset = max(delta_indices)
+        delta_arr = np.array(delta_indices)
+
+        all_relative = []
+        for ep in tqdm.tqdm(episodes, desc=f"Relative stats for {action_key}"):
+            ep_idx = ep["episode_index"]
+            chunk_idx = ep_idx // chunk_size
+            parquet_path = dataset_root / data_path_pattern.format(
+                episode_chunk=chunk_idx, episode_index=ep_idx
+            )
+            df = pd.read_parquet(parquet_path)
+
+            # Extract action and state arrays for this key
+            action_data = np.vstack(
+                [np.asarray(x, dtype=np.float32)[a_start:a_end] for x in df[action_col]]
+            )
+            state_data = np.vstack(
+                [np.asarray(x, dtype=np.float32)[s_start:s_end] for x in df[state_col]]
+            )
+
+            usable_length = len(df) - max_offset
+            for t in range(usable_length):
+                ref_state = state_data[t]  # shape: (dim,)
+                action_chunk = action_data[t + delta_arr]  # shape: (horizon, dim)
+                relative_chunk = action_chunk - ref_state  # broadcast subtract
+                all_relative.append(relative_chunk)
+
+        if not all_relative:
+            print(f"Warning: no data for {action_key}, skipping")
+            continue
+
+        stacked = np.stack(all_relative, axis=0)  # (N, horizon, dim)
+        # Compute stats along axis=0 → shape (horizon, dim), matching gr00t behavior.
+        # Each horizon step gets its own statistics.
+        rel_stats[action_key] = {
+            "mean": np.mean(stacked, axis=0).astype(np.float32).tolist(),
+            "std": np.std(stacked, axis=0).astype(np.float32).tolist(),
+            "min": np.min(stacked, axis=0).astype(np.float32).tolist(),
+            "max": np.max(stacked, axis=0).astype(np.float32).tolist(),
+            "q01": np.quantile(stacked, 0.01, axis=0).astype(np.float32).tolist(),
+            "q99": np.quantile(stacked, 0.99, axis=0).astype(np.float32).tolist(),
+        }
+
+    return rel_stats
 
 
 def compute_stats(dataset, batch_size=8, num_workers=8, max_num_samples=None):

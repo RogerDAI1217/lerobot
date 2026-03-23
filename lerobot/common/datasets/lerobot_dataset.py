@@ -28,7 +28,7 @@ import torch.utils
 from datasets import load_dataset
 from huggingface_hub import create_repo, snapshot_download, upload_folder
 
-from lerobot.common.datasets.compute_stats import aggregate_stats, compute_stats
+from lerobot.common.datasets.compute_stats import aggregate_stats, compute_stats, compute_stats_from_parquet
 from lerobot.common.datasets.image_writer import AsyncImageWriter, write_image
 from lerobot.common.datasets.utils import (
     DEFAULT_FEATURES,
@@ -892,7 +892,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         return video_paths
 
-    def consolidate(self, run_compute_stats: bool = True, keep_image_files: bool = False) -> None:
+    def consolidate(
+        self,
+        run_compute_stats: bool = True,
+        keep_image_files: bool = False,
+        lowdim_only_stats: bool = True,
+    ) -> None:
         self.hf_dataset = self.load_hf_dataset()
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         check_timestamps_sync(self.hf_dataset, self.episode_data_index, self.fps, self.tolerance_s)
@@ -914,8 +919,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         if run_compute_stats:
             self.stop_image_writer()
-            # TODO(aliberts): refactor stats in save_episodes
-            self.meta.stats = compute_stats(self)
+            if lowdim_only_stats:
+                # Fast path: compute stats from parquet files only (no video decoding).
+                # Matches gr00t's generate_stats() approach. Includes q01/q99 quantiles.
+                self.meta.stats = compute_stats_from_parquet(self.root)
+            else:
+                # Slow path: iterate full dataset including video frames.
+                self.meta.stats = compute_stats(self)
             serialized_stats = serialize_dict(self.meta.stats)
             write_json(serialized_stats, self.root / STATS_PATH)
             self.consolidated = True
