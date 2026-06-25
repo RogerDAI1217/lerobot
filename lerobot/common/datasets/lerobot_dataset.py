@@ -28,7 +28,7 @@ import torch.utils
 from datasets import load_dataset
 from huggingface_hub import create_repo, snapshot_download, upload_folder
 
-from lerobot.common.datasets.compute_stats import aggregate_stats, compute_stats
+from lerobot.common.datasets.compute_stats import aggregate_stats, compute_stats, compute_stats_from_parquet
 from lerobot.common.datasets.image_writer import AsyncImageWriter, write_image
 from lerobot.common.datasets.utils import (
     DEFAULT_FEATURES,
@@ -754,8 +754,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
         Use 'encode_videos' if you want to encode videos during the saving of this episode. Otherwise,
         you can do it later with dataset.consolidate(). This is to give more flexibility on when to spend
         time for video encoding.
+        
+        Args:
+            task: Task name for this episode
+            encode_videos: Whether to encode videos immediately
+            episode_data: Optional pre-built episode buffer. If provided, uses this instead of 
+                         self.episode_buffer and does NOT reset the internal buffer.
         """
-        if not episode_data:
+        if episode_data is not None:
+            episode_buffer = episode_data
+        else:
             episode_buffer = self.episode_buffer
 
         episode_length = episode_buffer.pop("size")
@@ -880,11 +888,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
             img_dir = self._get_image_file_path(
                 episode_index=episode_index, image_key=key, frame_index=0
             ).parent
-            encode_video_frames(img_dir, video_path, self.fps, overwrite=True)
+            encode_video_frames(img_dir, video_path, self.fps, vcodec="libx264", overwrite=True)
 
         return video_paths
 
-    def consolidate(self, run_compute_stats: bool = True, keep_image_files: bool = False) -> None:
+    def consolidate(
+        self,
+        run_compute_stats: bool = True,
+        keep_image_files: bool = False,
+        lowdim_only_stats: bool = True,
+    ) -> None:
         self.hf_dataset = self.load_hf_dataset()
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         check_timestamps_sync(self.hf_dataset, self.episode_data_index, self.fps, self.tolerance_s)
@@ -906,8 +919,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         if run_compute_stats:
             self.stop_image_writer()
-            # TODO(aliberts): refactor stats in save_episodes
-            self.meta.stats = compute_stats(self)
+            if lowdim_only_stats:
+                self.meta.stats = compute_stats_from_parquet(self.root)
+            else:
+                # Slow path: iterate full dataset including video frames.
+                self.meta.stats = compute_stats(self)
             serialized_stats = serialize_dict(self.meta.stats)
             write_json(serialized_stats, self.root / STATS_PATH)
             self.consolidated = True
